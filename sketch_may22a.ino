@@ -1,4 +1,5 @@
 #include "esp_camera.h"
+#include "ESPmDNS.h"
 #include <WiFi.h>
 
 #define CAMERA_MODEL_XIAO_ESP32S3
@@ -9,8 +10,8 @@
 // Wifi credentials
 // ====================
 
-const char* ssid = "Cornfield";
-const char* password = "expertarrival345";
+const char* ssid = "mini-field";
+const char* password = "goodlife";
 
 void startCameraServer();
 void setupLedFlash(int pin);
@@ -93,22 +94,59 @@ void setup() {
 #if defined(LED_GPIO_NUM)
   setupLedFlash(LED_GPIO_NUM);
 #endif
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  unsigned long wifiStart = millis();
+  const unsigned long wifiTimeout = 30000; // 30 sec
 
   WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
+
+    if (millis() - wifiStart > wifiTimeout) {
+      Serial.println("\nWiFi connection timed out");
+      Serial.print("Last status code: ");
+      Serial.println(WiFi.status());
+      Serial.print("RSSI (if any): ");
+      Serial.println(WiFi.RSSI());
+      ESP.restart();
+      break;
+    }
   }
-  Serial.println("");
-  Serial.println("WiFi connected");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.print("IP addess: ");
+    Serial.println(WiFi.linkLocalIPv6());
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("Subnet: ");
+    Serial.println(WiFi.subnetMask());
+    Serial.print("DNS: ");
+    Serial.println(WiFi.dnsIP());
+    Serial.print("BSSID: ");
+    Serial.println(WiFi.BSSIDstr());
+    Serial.print("Channel: ");
+    Serial.println(WiFi.channel());
+  } else {
+    Serial.println("WiFi NOT connected. Check antenna, 2.4 GHz, credentials, and router security.");
+  }
+
+  if (!MDNS.begin("babycam")) {
+    Serial.println("Error setting up MDNS responder!");
+  } else {
+    Serial.println("mDNS responder started: http://babycam.local");
+  }
 
   startCameraServer();
-
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.print("' to connect");
+  Serial.println("Camera server started");
 }
 
 void loop() {
