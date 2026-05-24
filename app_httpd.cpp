@@ -13,6 +13,7 @@
 #include "ESP_I2S.h"
 #include "Preferences.h"
 #include "camera_index.h"
+#include "dashboard_index.h"
 #include "esp32-hal-ledc.h"
 #include "esp_camera.h"
 #include "esp_http_server.h"
@@ -1291,6 +1292,13 @@ static esp_err_t audio_handler(httpd_req_t *req) {
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
   httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+  return httpd_resp_send(req, (const char *)dashboard_html_gz,
+                         dashboard_html_gz_len);
+}
+
+static esp_err_t legacy_index_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
   sensor_t *s = esp_camera_sensor_get();
   if (s != NULL) {
     if (s->id.PID == OV3660_PID) {
@@ -1324,6 +1332,11 @@ void startCameraServer() {
                            .supported_subprotocol = NULL
 #endif
   };
+
+  httpd_uri_t legacy_index_uri = {.uri = "/legacy",
+                                  .method = HTTP_GET,
+                                  .handler = legacy_index_handler,
+                                  .user_ctx = NULL};
 
   httpd_uri_t status_uri = {.uri = "/status",
                             .method = HTTP_GET,
@@ -1487,6 +1500,7 @@ void startCameraServer() {
   log_i("Starting web server on port: '%d'", config.server_port);
   if (httpd_start(&camera_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(camera_httpd, &index_uri);
+    httpd_register_uri_handler(camera_httpd, &legacy_index_uri);
     httpd_register_uri_handler(camera_httpd, &cmd_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
