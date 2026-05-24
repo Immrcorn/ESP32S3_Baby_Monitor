@@ -182,7 +182,8 @@ I2SClass I2S;
 Preferences prefs;
 
 volatile float currentLevel = 0.0f;
-volatile int threshold = 45;
+volatile float audioGain = 4.0f;
+volatile float threshold = 3.0f;
 volatile bool audioBurstActive = false;
 volatile bool audioOk = false;
 volatile uint32_t burstEndTime = 0;
@@ -192,8 +193,20 @@ volatile uint32_t burstEndTime = 0;
 #define BURST_MS 20000
 #define AUDIO_RING_SLOTS 8
 #define AUDIO_BURST_WAIT_MS 2000
+#define HPF_CUTOFF_HZ 80.0f
 
 int16_t audioChunkBuffer[CHUNK_SAMPLES];
+int16_t amplifiedBuffer[CHUNK_SAMPLES];
+
+static inline int16_t clampSample(int32_t v) {
+  if (v > 32767) {
+    return 32767;
+  }
+  if (v < -32768) {
+    return -32768;
+  }
+  return (int16_t)v;
+}
 
 struct AudioRingSlot {
   int16_t samples[CHUNK_SAMPLES];
@@ -1251,7 +1264,12 @@ static esp_err_t win_handler(httpd_req_t *req) {
   return httpd_resp_send(req, NULL, 0);
 }
 void audioLevelTask(void *param) {
-  const float alpha = 0.25f;
+  const float alpha = 0.35f;
+  const float hpAlpha =
+      expf(-2.0f * 3.14159265f * HPF_CUTOFF_HZ / (float)SAMPLE_RATE);
+  float hpPrevIn = 0.0f;
+  float hpPrevOut = 0.0f;
+  float noiseFloor = 0.0f;
   uint32_t lastDebugMs = 0;
   uint32_t zeroReadStreak = 0;
 
@@ -1260,13 +1278,37 @@ void audioLevelTask(void *param) {
                                      CHUNK_SAMPLES * sizeof(int16_t));
     if (bytesRead > 0) {
       int sampleCount = bytesRead / sizeof(int16_t);
+      float gain = audioGain;
       int64_t sum = 0;
+
       for (int i = 0; i < sampleCount; i++) {
-        int32_t sample = audioChunkBuffer[i];
-        sum += (int64_t)sample * sample;
+        float in = (float)audioChunkBuffer[i];
+        float hp = hpAlpha * (hpPrevOut + in - hpPrevIn);
+        hpPrevIn = in;
+        hpPrevOut = hp;
+
+        int32_t amplified = (int32_t)(hp * gain);
+        int16_t out = clampSample(amplified);
+        amplifiedBuffer[i] = out;
+        sum += (int64_t)out * out;
       }
+
       float rms = sqrtf((float)sum / (float)sampleCount);
-      float normalized = (rms / 32768.0f) * 100.0f;
+      float rawNormalized = (rms / 32768.0f) * 100.0f;
+      if (!isfinite(rawNormalized)) {
+        rawNormalized = 0.0f;
+      }
+
+      if (rawNormalized < noiseFloor || noiseFloor < 0.1f) {
+        noiseFloor = 0.995f * noiseFloor + 0.005f * rawNormalized;
+      } else {
+        noiseFloor = 0.9995f * noiseFloor + 0.0005f * rawNormalized;
+      }
+
+      float normalized = rawNormalized - noiseFloor;
+      if (normalized < 0.0f) {
+        normalized = 0.0f;
+      }
       if (!isfinite(normalized)) {
         normalized = 0.0f;
       }
@@ -1281,7 +1323,7 @@ void audioLevelTask(void *param) {
 
       zeroReadStreak = 0;
 
-      audioRingPush(audioChunkBuffer, bytesRead);
+      audioRingPush(amplifiedBuffer, bytesRead);
 
       if (!audioBurstActive && currentLevel > threshold) {
         audioBurstActive = true;
@@ -1301,8 +1343,9 @@ void audioLevelTask(void *param) {
     if (now - lastDebugMs >= 5000) {
       lastDebugMs = now;
       float lvl = isfinite(currentLevel) ? currentLevel : 0.0f;
-      Serial.printf("[AUDIO] level=%.1f lastBytes=%u zeroStreak=%u\n", lvl,
-                    (unsigned)bytesRead, (unsigned)zeroReadStreak);
+      Serial.printf("[AUDIO] level=%.1f gain=%.0f lastBytes=%u zeroStreak=%u\n",
+                    lvl, audioGain, (unsigned)bytesRead,
+                    (unsigned)zeroReadStreak);
     }
 
     vTaskDelay(pdMS_TO_TICKS(5));
@@ -1316,10 +1359,15 @@ static esp_err_t level_handler(httpd_req_t *req) {
     level = 0.0f;
   }
 
-  char json[96];
+  char json[128];
+  float gain = audioGain;
+  if (!isfinite(gain) || gain < 1.0f) {
+    gain = 4.0f;
+  }
   snprintf(json, sizeof(json),
-           "{\"level\":%.1f,\"threshold\":%d,\"burst\":%d,\"audio_ok\":%d}",
-           level, threshold, audioBurstActive ? 1 : 0, audioOk ? 1 : 0);
+           "{\"level\":%.1f,\"threshold\":%.1f,\"burst\":%d,\"audio_ok\":%d,"
+           "\"gain\":%.0f}",
+           level, threshold, audioBurstActive ? 1 : 0, audioOk ? 1 : 0, gain);
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1332,18 +1380,36 @@ static esp_err_t set_threshold_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  char valStr[8];
-  if (httpd_query_key_value(buf, "value", valStr, sizeof(valStr)) != ESP_OK) {
-    free(buf);
-    return httpd_resp_send_404(req);
+  bool updated = false;
+
+  char valStr[16];
+  if (httpd_query_key_value(buf, "value", valStr, sizeof(valStr)) == ESP_OK) {
+    float newVal = strtof(valStr, NULL);
+    if (newVal >= 0.1f && newVal <= 95.0f) {
+      threshold = newVal;
+      prefs.putFloat("threshold", threshold);
+      log_i("[AUDIO] Threshold set %.1f", threshold);
+      Serial.printf("[AUDIO] Threshold set %.1f\n", threshold);
+      updated = true;
+    }
   }
+
+  char gainStr[8];
+  if (httpd_query_key_value(buf, "gain", gainStr, sizeof(gainStr)) == ESP_OK) {
+    int gainVal = atoi(gainStr);
+    if (gainVal >= 1 && gainVal <= 16) {
+      audioGain = (float)gainVal;
+      prefs.putFloat("gain", audioGain);
+      log_i("[AUDIO] Gain set %.0f", audioGain);
+      Serial.printf("[AUDIO] Gain set %.0f\n", audioGain);
+      updated = true;
+    }
+  }
+
   free(buf);
 
-  int newVal = atoi(valStr);
-  if (newVal >= 5 && newVal <= 95) {
-    threshold = newVal;
-    prefs.putInt("threshold", threshold);
-    log_i("[AUDIO] Threshold set %d", threshold);
+  if (!updated) {
+    return httpd_resp_send_404(req);
   }
 
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1575,9 +1641,22 @@ void startCameraServer() {
 
   // ======================= BABY MONITOR AUDIO INIT =====================
   prefs.begin("babymonitor", false);
-  threshold = prefs.getInt("threshold", 45);
-  log_i("[AUDIO] Loaded threshold = %d", threshold);
-  Serial.printf("[AUDIO] Loaded threshold = %d\n", threshold);
+  if (prefs.getType("threshold") == PT_I32) {
+    threshold = (float)prefs.getInt("threshold", 3);
+    prefs.putFloat("threshold", threshold);
+  } else {
+    threshold = prefs.getFloat("threshold", 3.0f);
+  }
+  if (!isfinite(threshold) || threshold < 0.1f || threshold > 95.0f) {
+    threshold = 3.0f;
+  }
+  audioGain = prefs.getFloat("gain", 4.0f);
+  if (!isfinite(audioGain) || audioGain < 1.0f || audioGain > 16.0f) {
+    audioGain = 4.0f;
+  }
+  log_i("[AUDIO] Loaded threshold = %.1f", threshold);
+  Serial.printf("[AUDIO] Loaded threshold = %.1f, gain = %.0f\n", threshold,
+                audioGain);
 
   I2S.setPinsPdmRx(42, 41);
   if (!I2S.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT,
