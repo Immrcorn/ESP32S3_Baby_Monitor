@@ -55,7 +55,7 @@ void setup() {
   //                      for larger pre-allocated fram buffer
   if(config.pixel_format == PIXFORMAT_JPEG){
     if(psramFound()){
-      config.jpeg_quality = 10;
+      config.jpeg_quality = 15;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
     } else {
@@ -86,8 +86,8 @@ void setup() {
     s->set_saturation(s, -2); // lower saturation
   } 
   // drop down frame size for higher initial frame rate
-  if(config.pixel_format == PIXFORMAT_JPEG){
-    s->set_framesize(s, FRAMESIZE_QVGA);
+   if(config.pixel_format == PIXFORMAT_JPEG){
+    s->set_framesize(s, FRAMESIZE_VGA);
   }
 
 // setup LED Flash if LED pin is defined in camera_pins.h
@@ -124,7 +124,7 @@ void setup() {
     Serial.println("");
     Serial.println("WiFi connected");
     Serial.print("IP addess: ");
-    Serial.println(WiFi.linkLocalIPv6());
+    Serial.println(WiFi.LocalIP());
     Serial.print("Gateway: ");
     Serial.println(WiFi.gatewayIP());
     Serial.print("Subnet: ");
