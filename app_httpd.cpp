@@ -23,6 +23,7 @@
 #include "sdkconfig.h"
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <math.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
@@ -189,8 +190,55 @@ volatile uint32_t burstEndTime = 0;
 #define SAMPLE_RATE 16000
 #define CHUNK_SAMPLES 512
 #define BURST_MS 20000
+#define AUDIO_RING_SLOTS 8
+#define AUDIO_BURST_WAIT_MS 2000
 
 int16_t audioChunkBuffer[CHUNK_SAMPLES];
+
+struct AudioRingSlot {
+  int16_t samples[CHUNK_SAMPLES];
+  size_t byteCount;
+};
+
+static AudioRingSlot audioRing[AUDIO_RING_SLOTS];
+static volatile uint8_t audioRingWrite = 0;
+static volatile uint8_t audioRingRead = 0;
+static portMUX_TYPE audioRingMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void audioRingPush(const int16_t *samples, size_t byteCount) {
+  if (byteCount == 0) {
+    return;
+  }
+
+  portENTER_CRITICAL(&audioRingMux);
+  uint8_t nextWrite = (uint8_t)((audioRingWrite + 1) % AUDIO_RING_SLOTS);
+  if (nextWrite == audioRingRead) {
+    audioRingRead = (uint8_t)((audioRingRead + 1) % AUDIO_RING_SLOTS);
+  }
+
+  size_t copyBytes = byteCount;
+  if (copyBytes > CHUNK_SAMPLES * sizeof(int16_t)) {
+    copyBytes = CHUNK_SAMPLES * sizeof(int16_t);
+  }
+  memcpy(audioRing[audioRingWrite].samples, samples, copyBytes);
+  audioRing[audioRingWrite].byteCount = copyBytes;
+  audioRingWrite = nextWrite;
+  portEXIT_CRITICAL(&audioRingMux);
+}
+
+static bool audioRingPop(int16_t *outSamples, size_t *outByteCount) {
+  portENTER_CRITICAL(&audioRingMux);
+  if (audioRingRead == audioRingWrite) {
+    portEXIT_CRITICAL(&audioRingMux);
+    return false;
+  }
+
+  *outByteCount = audioRing[audioRingRead].byteCount;
+  memcpy(outSamples, audioRing[audioRingRead].samples, *outByteCount);
+  audioRingRead = (uint8_t)((audioRingRead + 1) % AUDIO_RING_SLOTS);
+  portEXIT_CRITICAL(&audioRingMux);
+  return true;
+}
 
 #if CONFIG_ESP_FACE_DETECT_ENABLED
 #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
@@ -1233,6 +1281,8 @@ void audioLevelTask(void *param) {
 
       zeroReadStreak = 0;
 
+      audioRingPush(audioChunkBuffer, bytesRead);
+
       if (!audioBurstActive && currentLevel > threshold) {
         audioBurstActive = true;
         burstEndTime = millis() + BURST_MS;
@@ -1302,26 +1352,37 @@ static esp_err_t set_threshold_handler(httpd_req_t *req) {
 
 // Audio burst streamer
 static esp_err_t audio_handler(httpd_req_t *req) {
-  httpd_resp_set_type(req, "audio/x-raw");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  uint32_t waitStart = millis();
+  while (!audioBurstActive && (millis() - waitStart) < AUDIO_BURST_WAIT_MS) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 
   if (!audioBurstActive) {
-    return httpd_resp_send(req, NULL, 0); // nothing playng
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, NULL, 0);
   }
 
-  // Stream Chunks while burst is active
-  while (audioBurstActive && millis() < burstEndTime) {
-    size_t bytesRead = I2S.readBytes((char *)audioChunkBuffer,
-                                     CHUNK_SAMPLES * sizeof(int16_t));
+  httpd_resp_set_type(req, "application/octet-stream");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  httpd_resp_set_hdr(req, "Access-Control-Expose-Headers",
+                     "X-Audio-Sample-Rate, X-Audio-Channels, X-Audio-Format");
+  httpd_resp_set_hdr(req, "X-Audio-Sample-Rate", "16000");
+  httpd_resp_set_hdr(req, "X-Audio-Channels", "1");
+  httpd_resp_set_hdr(req, "X-Audio-Format", "pcm_s16le");
 
-    if (bytesRead > 0) {
-      if (httpd_resp_send_chunk(req, (const char *)audioChunkBuffer,
-                                bytesRead) != ESP_OK) {
+  int16_t streamChunk[CHUNK_SAMPLES];
+  while (audioBurstActive && millis() < burstEndTime) {
+    size_t chunkBytes = 0;
+    if (audioRingPop(streamChunk, &chunkBytes)) {
+      if (httpd_resp_send_chunk(req, (const char *)streamChunk, chunkBytes) !=
+          ESP_OK) {
         break;
       }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
     }
-    vTaskDelay(pdMS_TO_TICKS(1));
   }
+
   httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
 }

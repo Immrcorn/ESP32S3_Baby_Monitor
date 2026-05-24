@@ -237,6 +237,28 @@
       background: #243044;
     }
 
+    .sound-arm-btn {
+      display: block;
+      width: 100%;
+      margin-top: 12px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+
+    .sound-arm-btn.armed {
+      border-color: var(--ok);
+      color: var(--ok);
+    }
+
+    .sound-arm-btn:active {
+      background: #243044;
+    }
+
     @media (orientation: portrait) {
       .stream-wrap {
         aspect-ratio: auto;
@@ -295,6 +317,10 @@
       <label for="threshold">Alert threshold (<span id="threshold-value">45</span>)</label>
       <input id="threshold" type="range" min="5" max="95" value="45" step="1">
 
+      <button type="button" id="btn-enable-sound" class="sound-arm-btn">
+        Tap to enable alert audio
+      </button>
+
       <div class="meta">
         <span id="burst-status">Idle</span>
         <span id="last-update">—</span>
@@ -308,6 +334,7 @@
 
   <script>
     const POLL_MS = 300;
+    const AUDIO_SAMPLE_RATE = 16000;
     const baseHost = document.location.origin;
     const streamUrl = baseHost.replace(/:\d+$/, '') + ':81/stream';
 
@@ -325,11 +352,131 @@
     const connectionText = document.getElementById('connection-text');
     const btnVflip = document.getElementById('btn-vflip');
     const btnHmirror = document.getElementById('btn-hmirror');
+    const btnEnableSound = document.getElementById('btn-enable-sound');
 
     let thresholdDirty = false;
     let lastBurst = false;
     let streamLive = false;
     let audioLive = false;
+    let soundEnabled = false;
+    let burstAudioPlaying = false;
+    let audioContext = null;
+    let audioAbortController = null;
+
+    function getAudioContext() {
+      if (!audioContext) {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        audioContext = new AudioCtx({ sampleRate: AUDIO_SAMPLE_RATE });
+      }
+      return audioContext;
+    }
+
+    function updateSoundButton() {
+      if (soundEnabled) {
+        btnEnableSound.textContent = 'Alert audio armed';
+        btnEnableSound.classList.add('armed');
+      } else {
+        btnEnableSound.textContent = 'Tap to enable alert audio';
+        btnEnableSound.classList.remove('armed');
+      }
+    }
+
+    async function enableSound() {
+      try {
+        const ctx = getAudioContext();
+        if (ctx.state === 'suspended') {
+          await ctx.resume();
+        }
+        soundEnabled = true;
+        updateSoundButton();
+      } catch (err) {
+        soundEnabled = false;
+        updateSoundButton();
+      }
+    }
+
+    btnEnableSound.addEventListener('click', enableSound);
+
+    async function startBurstAudio() {
+      if (!soundEnabled || burstAudioPlaying) {
+        return;
+      }
+
+      burstAudioPlaying = true;
+      audioAbortController = new AbortController();
+
+      try {
+        const ctx = getAudioContext();
+        if (ctx.state === 'suspended') {
+          await ctx.resume();
+        }
+
+        const response = await fetch(baseHost + '/audio', {
+          signal: audioAbortController.signal
+        });
+        if (!response.ok || !response.body) {
+          return;
+        }
+
+        let playTime = ctx.currentTime + 0.15;
+        let pending = new Uint8Array(0);
+        const reader = response.body.getReader();
+
+        while (true) {
+          const result = await reader.read();
+          if (result.done) {
+            break;
+          }
+
+          const incoming = result.value;
+          const merged = new Uint8Array(pending.length + incoming.length);
+          merged.set(pending);
+          merged.set(incoming, pending.length);
+          pending = merged;
+
+          const usable = pending.length - (pending.length % 2);
+          if (usable < 2) {
+            continue;
+          }
+
+          const chunk = pending.slice(0, usable);
+          pending = pending.slice(usable);
+
+          const samples = new Int16Array(
+            chunk.buffer,
+            chunk.byteOffset,
+            usable / 2
+          );
+          const float32 = new Float32Array(samples.length);
+          for (let i = 0; i < samples.length; i++) {
+            float32[i] = samples[i] / 32768;
+          }
+
+          const buffer = ctx.createBuffer(1, float32.length, AUDIO_SAMPLE_RATE);
+          buffer.copyToChannel(float32, 0);
+
+          const source = ctx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(ctx.destination);
+          source.start(playTime);
+          playTime += buffer.duration;
+        }
+
+        const waitMs = Math.max(0, (playTime - ctx.currentTime) * 1000);
+        if (waitMs > 0) {
+          await new Promise(function (resolve) {
+            setTimeout(resolve, waitMs);
+          });
+        }
+      } catch (err) {
+        if (err && err.name !== 'AbortError') {
+          console.error('Burst audio error', err);
+        }
+      } finally {
+        burstAudioPlaying = false;
+        audioAbortController = null;
+      }
+    }
 
     function updateConnectionStatus(burst) {
       if (burst) {
@@ -446,6 +593,7 @@
           if ('Notification' in window && Notification.permission === 'granted') {
             new Notification('Baby Monitor', { body: 'Sound level above threshold' });
           }
+          startBurstAudio();
         }
         lastBurst = burst;
 
@@ -461,6 +609,7 @@
       Notification.requestPermission();
     }
 
+    updateSoundButton();
     pollLevel();
     setInterval(pollLevel, POLL_MS);
   </script>
