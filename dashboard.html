@@ -215,6 +215,45 @@
     .footer-links a:hover {
       text-decoration: underline;
     }
+
+    .stream-controls {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .stream-controls button {
+      padding: 8px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+
+    .stream-controls button:active {
+      background: #243044;
+    }
+
+    @media (orientation: portrait) {
+      .stream-wrap {
+        aspect-ratio: auto;
+        min-height: 50vh;
+      }
+    }
+
+    @media (orientation: landscape) {
+      .stream-wrap {
+        aspect-ratio: auto;
+        max-height: 75vh;
+      }
+
+      main {
+        padding: 8px 12px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -235,6 +274,11 @@
     <div class="stream-wrap">
       <div id="stream-placeholder" class="stream-placeholder">Starting camera stream…</div>
       <img id="stream" alt="Live camera feed" crossorigin>
+    </div>
+
+    <div class="stream-controls">
+      <button type="button" id="btn-vflip">Flip vertical</button>
+      <button type="button" id="btn-hmirror">Mirror</button>
     </div>
 
     <section class="panel">
@@ -279,17 +323,43 @@
     const lastUpdate = document.getElementById('last-update');
     const statusDot = document.getElementById('status-dot');
     const connectionText = document.getElementById('connection-text');
+    const btnVflip = document.getElementById('btn-vflip');
+    const btnHmirror = document.getElementById('btn-hmirror');
 
     let thresholdDirty = false;
     let lastBurst = false;
+    let streamLive = false;
+    let audioLive = false;
+
+    function updateConnectionStatus(burst) {
+      if (burst) {
+        statusDot.className = 'status-dot alert';
+        connectionText.textContent = 'Alert';
+        return;
+      }
+      if (streamLive && audioLive) {
+        statusDot.className = 'status-dot live';
+        connectionText.textContent = 'Live';
+      } else if (streamLive) {
+        statusDot.className = 'status-dot live';
+        connectionText.textContent = 'Live · No audio';
+      } else {
+        statusDot.className = 'status-dot';
+        connectionText.textContent = 'Offline';
+      }
+    }
 
     streamImg.onload = function () {
       streamPlaceholder.style.display = 'none';
+      streamLive = true;
+      updateConnectionStatus(lastBurst);
     };
 
     streamImg.onerror = function () {
       streamPlaceholder.textContent = 'Stream unavailable — retrying…';
       streamPlaceholder.style.display = 'grid';
+      streamLive = false;
+      updateConnectionStatus(lastBurst);
       setTimeout(function () {
         streamImg.src = streamUrl + '?t=' + Date.now();
       }, 2000);
@@ -317,6 +387,33 @@
       thresholdDirty = false;
     });
 
+    function cameraControl(variable, value) {
+      fetch(baseHost + '/control?var=' + encodeURIComponent(variable) + '&val=' + encodeURIComponent(value))
+        .catch(function () {});
+    }
+
+    btnVflip.addEventListener('click', function () {
+      fetch(baseHost + '/status')
+        .then(function (r) { return r.json(); })
+        .then(function (s) {
+          cameraControl('vflip', s.vflip ? 0 : 1);
+        })
+        .catch(function () {
+          cameraControl('vflip', 1);
+        });
+    });
+
+    btnHmirror.addEventListener('click', function () {
+      fetch(baseHost + '/status')
+        .then(function (r) { return r.json(); })
+        .then(function (s) {
+          cameraControl('hmirror', s.hmirror ? 0 : 1);
+        })
+        .catch(function () {
+          cameraControl('hmirror', 1);
+        });
+    });
+
     async function pollLevel() {
       try {
         const response = await fetch(baseHost + '/level');
@@ -325,9 +422,11 @@
         }
 
         const data = await response.json();
-        const level = Number(data.level) || 0;
+        const levelRaw = Number(data.level);
+        const level = Number.isFinite(levelRaw) ? levelRaw : 0;
         const threshold = Number(data.threshold) || 45;
         const burst = Number(data.burst) === 1;
+        audioLive = Number(data.audio_ok) === 1;
 
         levelFill.style.width = Math.min(100, Math.max(0, level)) + '%';
         levelValue.textContent = level.toFixed(1);
@@ -340,9 +439,8 @@
         }
 
         alertBanner.classList.toggle('active', burst);
-        burstStatus.textContent = burst ? 'Alert active' : 'Idle';
-        statusDot.className = 'status-dot ' + (burst ? 'alert' : 'live');
-        connectionText.textContent = burst ? 'Alert' : 'Live';
+        burstStatus.textContent = burst ? 'Alert active' : (audioLive ? 'Idle' : 'Mic unavailable');
+        updateConnectionStatus(burst);
 
         if (burst && !lastBurst) {
           if ('Notification' in window && Notification.permission === 'granted') {
@@ -353,9 +451,9 @@
 
         lastUpdate.textContent = new Date().toLocaleTimeString();
       } catch (err) {
-        statusDot.className = 'status-dot';
-        connectionText.textContent = 'Offline';
-        burstStatus.textContent = 'No data';
+        audioLive = false;
+        burstStatus.textContent = streamLive ? 'No audio data' : 'No data';
+        updateConnectionStatus(lastBurst);
       }
     }
 

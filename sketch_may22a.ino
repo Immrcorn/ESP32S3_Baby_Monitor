@@ -6,6 +6,10 @@
 
 #include "camera_pins.h"
 
+// Set to 1 if the camera module is mounted upside-down or mirrored.
+#define CAMERA_VFLIP 0
+#define CAMERA_HMIRROR 0
+
 // ====================
 // Wifi credentials
 // ====================
@@ -84,7 +88,10 @@ void setup() {
     s->set_vflip(s, 1); // flip it back
     s->set_brightness(s, 1); // up the brightness a bit
     s->set_saturation(s, -2); // lower saturation
-  } 
+  } else {
+    s->set_vflip(s, CAMERA_VFLIP);
+    s->set_hmirror(s, CAMERA_HMIRROR);
+  }
   // drop down frame size for higher initial frame rate
    if(config.pixel_format == PIXFORMAT_JPEG){
     s->set_framesize(s, FRAMESIZE_VGA);
@@ -124,7 +131,7 @@ void setup() {
     Serial.println("");
     Serial.println("WiFi connected");
     Serial.print("IP addess: ");
-    Serial.println(WiFi.LocalIP());
+    Serial.println(WiFi.localIP());
     Serial.print("Gateway: ");
     Serial.println(WiFi.gatewayIP());
     Serial.print("Subnet: ");

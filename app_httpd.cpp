@@ -23,6 +23,7 @@
 #include "sdkconfig.h"
 #include <cstddef>
 #include <cstdint>
+#include <math.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -182,6 +183,7 @@ Preferences prefs;
 volatile float currentLevel = 0.0f;
 volatile int threshold = 45;
 volatile bool audioBurstActive = false;
+volatile bool audioOk = false;
 volatile uint32_t burstEndTime = 0;
 
 #define SAMPLE_RATE 16000
@@ -1012,6 +1014,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
   p += sprintf(p, "\"raw_gma\":%u,", s->status.raw_gma);
   p += sprintf(p, "\"lenc\":%u,", s->status.lenc);
   p += sprintf(p, "\"hmirror\":%u,", s->status.hmirror);
+  p += sprintf(p, "\"vflip\":%u,", s->status.vflip);
   p += sprintf(p, "\"dcw\":%u,", s->status.dcw);
   p += sprintf(p, "\"colorbar\":%u", s->status.colorbar);
 #if CONFIG_LED_ILLUMINATOR_ENABLED
@@ -1201,38 +1204,72 @@ static esp_err_t win_handler(httpd_req_t *req) {
 }
 void audioLevelTask(void *param) {
   const float alpha = 0.25f;
+  uint32_t lastDebugMs = 0;
+  uint32_t zeroReadStreak = 0;
+
   while (true) {
     size_t bytesRead = I2S.readBytes((char *)audioChunkBuffer,
                                      CHUNK_SAMPLES * sizeof(int16_t));
     if (bytesRead > 0) {
-      long sum = 0;
-      for (int i = 0; i < CHUNK_SAMPLES; i++) {
-        sum += (int32_t)audioChunkBuffer[i] * audioChunkBuffer[i];
+      int sampleCount = bytesRead / sizeof(int16_t);
+      int64_t sum = 0;
+      for (int i = 0; i < sampleCount; i++) {
+        int32_t sample = audioChunkBuffer[i];
+        sum += (int64_t)sample * sample;
       }
-      float rms = sqrtf(sum / (float)CHUNK_SAMPLES);
+      float rms = sqrtf((float)sum / (float)sampleCount);
       float normalized = (rms / 32768.0f) * 100.0f;
+      if (!isfinite(normalized)) {
+        normalized = 0.0f;
+      }
+      if (!isfinite(currentLevel)) {
+        currentLevel = 0.0f;
+      }
 
       currentLevel = alpha * normalized + (1.0f - alpha) * currentLevel;
+      if (!isfinite(currentLevel)) {
+        currentLevel = 0.0f;
+      }
 
-      // Threshold trigger with simper hysteresis
+      zeroReadStreak = 0;
+
       if (!audioBurstActive && currentLevel > threshold) {
         audioBurstActive = true;
         burstEndTime = millis() + BURST_MS;
         log_i("[AUDIO] Burst started - level=%.1f", currentLevel);
       }
+    } else {
+      zeroReadStreak++;
     }
+
     if (audioBurstActive && millis() > burstEndTime) {
       audioBurstActive = false;
       log_i("[AUDIO] Burst ended");
     }
+
+    uint32_t now = millis();
+    if (now - lastDebugMs >= 5000) {
+      lastDebugMs = now;
+      float lvl = isfinite(currentLevel) ? currentLevel : 0.0f;
+      Serial.printf("[AUDIO] level=%.1f lastBytes=%u zeroStreak=%u\n", lvl,
+                    (unsigned)bytesRead, (unsigned)zeroReadStreak);
+    }
+
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
 static esp_err_t level_handler(httpd_req_t *req) {
-  char json[80];
-  snprintf(json, sizeof(json), "{\"level\":%.1f,\"threshold\":%d,\"burst\":%d}",
-           currentLevel, threshold, audioBurstActive ? 1 : 0);
+  float level = currentLevel;
+  if (!isfinite(level)) {
+    currentLevel = 0.0f;
+    level = 0.0f;
+  }
+
+  char json[96];
+  snprintf(json, sizeof(json),
+           "{\"level\":%.1f,\"threshold\":%d,\"burst\":%d,\"audio_ok\":%d}",
+           level, threshold, audioBurstActive ? 1 : 0, audioOk ? 1 : 0);
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -1479,13 +1516,18 @@ void startCameraServer() {
   prefs.begin("babymonitor", false);
   threshold = prefs.getInt("threshold", 45);
   log_i("[AUDIO] Loaded threshold = %d", threshold);
+  Serial.printf("[AUDIO] Loaded threshold = %d\n", threshold);
 
   I2S.setPinsPdmRx(42, 41);
   if (!I2S.begin(I2S_MODE_PDM_RX, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT,
                  I2S_SLOT_MODE_MONO)) {
+    audioOk = false;
     log_e("[AUDIO] I2S microphone initialization FAILED");
+    Serial.println("[AUDIO] I2S microphone initialization FAILED");
   } else {
+    audioOk = true;
     log_i("[AUDIO] I2S microphone ready on GPIOs 42/41");
+    Serial.println("[AUDIO] I2S microphone ready on GPIOs 42/41");
     xTaskCreatePinnedToCore(audioLevelTask, "audioLevelTask", 4096, NULL, 5,
                             NULL, 1);
   }
