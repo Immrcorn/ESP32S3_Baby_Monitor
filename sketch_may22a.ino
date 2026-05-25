@@ -14,8 +14,8 @@
 // Wifi credentials
 // ====================
 
-const char* ssid = "mini-field";
-const char* password = "goodlife";
+const char* ssid = "*******";
+const char* password = "******";
 
 void startCameraServer();
 void setupLedFlash(int pin);
